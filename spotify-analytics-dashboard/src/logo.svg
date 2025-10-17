@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="TG logo">
+  <!-- Black rounded square background -->
+  <rect width="512" height="512" rx="64" fill="#000000"></rect>
+  <!-- Green TG letters -->
+  <text x="50%" y="50%" text-anchor="middle" dominant-baseline="middle" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="240" font-weight="800" fill="#22C55E" letter-spacing="4">
+    TG
+  </text>
+</svg>

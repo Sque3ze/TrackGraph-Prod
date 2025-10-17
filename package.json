@@ -1,0 +1,15 @@
+{
+  "name": "spotify-analysis",
+  "private": true,
+  "scripts": {
+    "test:unit": "npm run test --prefix spotify-analytics-dashboard -- --watchAll=false",
+    "test:playwright": "playwright test -c tests/playwright.config.ts",
+    "test:perf": "playwright test -c tests/playwright.config.ts tests/playwright/performance.spec.ts",
+    "test:smoke": "playwright test -c tests/playwright.config.ts tests/playwright/smoke.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.2",
+    "typescript": "^5.6.3"
+  }
+}
+

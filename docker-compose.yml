@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      # Default demo env enables cache-only hydration for testers
+      - ./docker/demo.env
+      # Local overrides like credentials, DEMO_MODE=0
+      - ./backend/.env
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./spotify-analytics-dashboard
+      args:
+        # Browser will call the host-exposed backend
+        - REACT_APP_API_BASE=${REACT_APP_API_BASE:-http://localhost:8000}
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend

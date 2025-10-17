@@ -1,0 +1,36 @@
+## Datasets and caches
+data/
+raw_spotify_data/
+scripts&data/
+backend/data/
+backend/new_cache.json
+spotify_images.json
+
+## Python artifacts
+__pycache__/
+*.py[cod]
+*__pycache__/
+
+## Virtual environments
+.venv/
+spvenv/
+
+## Environment files
+.env
+backend/.env
+
+## Node / frontend artifacts
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+## Test & profiling output
+playwright-report/
+test-results/
+performance/
+
+## Local helper files (not for commit)
+localHelpers/
+fix_data_for_publish.py
+.DS_Store
