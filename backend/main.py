@@ -16,7 +16,6 @@ from typing import Literal, Optional, Sequence
 import time
 import json
 import io
-import tempfile
 from pathlib import Path
 from functools import lru_cache
 
@@ -27,31 +26,23 @@ import httpx
 import requests
 import threading
 
+import history
+
 try:
-    from backend.config import (
+    from config import (
         AWS_REGION,
-        DATA_PATH,
         DEMO_MODE,
         IMAGE_CACHE_S3_BUCKET,
         IMAGE_CACHE_S3_KEY,
-        REQUIRED_COLUMNS,
-        S3_BUCKET,
-        S3_ETAG_CACHE,
-        S3_KEY,
         SPOTIFY_CLIENT_ID,
         SPOTIFY_CLIENT_SECRET,
     )
 except ModuleNotFoundError:
     from config import (
         AWS_REGION,
-        DATA_PATH,
         DEMO_MODE,
         IMAGE_CACHE_S3_BUCKET,
         IMAGE_CACHE_S3_KEY,
-        REQUIRED_COLUMNS,
-        S3_BUCKET,
-        S3_ETAG_CACHE,
-        S3_KEY,
         SPOTIFY_CLIENT_ID,
         SPOTIFY_CLIENT_SECRET,
     )
@@ -88,145 +79,16 @@ async def get_app_token() -> str:
         return _token_cache["access_token"]
 
 
-def _prepare_history_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    # Normalize history so downstream aggregations work consistently.
-    if df is None:
-        raise ValueError("No data provided")
-
-    df = df.copy()
-    df.columns = [c.strip() for c in df.columns]
-
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing expected columns: {missing}")
-
-    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-    df = df.dropna(subset=["ts", "ms_played"])
-    df = df.dropna(
-        subset=["master_metadata_track_name", "master_metadata_album_artist_name"],
-        how="all",
-    )
-    df["ms_played"] = pd.to_numeric(df["ms_played"], errors="coerce").fillna(0).astype("int64")
-
-    for col in [
-        "master_metadata_track_name",
-        "master_metadata_album_artist_name",
-        "master_metadata_album_album_name",
-    ]:
-        df[col] = df[col].fillna("Unknown").astype(str).str.strip()
-
-    df["date"] = df["ts"].dt.date
-    df["track_id"] = df["spotify_track_uri"].astype(str).str.replace(
-        "spotify:track:", "",
-        regex=False,
-    )
-
-    return df
-
-def _resolve_history_path() -> str:
-    # Return local path to history, optionally downloading from S3 when set.
-    if S3_BUCKET and S3_KEY:
-        if boto3 is None:
-            raise RuntimeError(
-                "boto3 is required to load streaming history from S3. Install boto3 or unset "
-                "SPOTIFY_HISTORY_S3_BUCKET/SPOTIFY_HISTORY_S3_KEY."
-            )
-        s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
-        try:
-            meta = s3.head_object(Bucket=S3_BUCKET, Key=S3_KEY)
-            etag = meta.get("ETag")
-        except ClientError as exc:  # pragma: no cover - external dependency
-            raise HTTPException(500, f"Unable to access S3 history object: {exc}") from exc
-
-        if S3_ETAG_CACHE.get("etag") == etag and S3_ETAG_CACHE.get("path"):
-            return S3_ETAG_CACHE["path"]
-
-        suffix = Path(S3_KEY).suffix or ".csv"
-        fd, tmp_path = tempfile.mkstemp(prefix="spotify_history_", suffix=suffix)
-        os.close(fd)
-        try:
-            s3.download_file(S3_BUCKET, S3_KEY, tmp_path)
-        except (ClientError, BotoCoreError) as exc:  # pragma: no cover - external dependency
-            raise HTTPException(500, f"Failed to download history from S3: {exc}") from exc
-
-        S3_ETAG_CACHE.update({"etag": etag, "path": tmp_path})
-        return tmp_path
-
-    if os.path.exists(DATA_PATH):
-        return DATA_PATH
-
-    static_json = Path(__file__).with_name("static_data.json")
-    if static_json.exists():
-        return static_json
-
-    raise FileNotFoundError(
-        "Streaming history not found. Set SPOTIFY_HISTORY_PATH or configure S3."
-    )
-
-
-def load_df() -> pd.DataFrame:
-    # Load history as DataFrame; merge optional packaged sample if present.
-    source_path = _resolve_history_path()
-    if str(source_path).endswith(".json"):
-        with open(source_path, "r") as fh:
-            data = json.load(fh)
-        df = pd.DataFrame(data)
-    else:
-        df = pd.read_csv(source_path)
-
-    return _prepare_history_dataframe(df)
-
-_df_cache: Optional[pd.DataFrame] = None
-_dataset_version: int = 0
-_data_source: str = "unknown"  # one of: unknown, default, uploaded
-
-# Simple in-memory response caches keyed by dataset version + filters
 _resp_cache_bubbles: dict = {}
 _resp_cache_summary: dict = {}
 _resp_cache_historical: dict = {}
 
+# Simple in-memory response caches keyed by dataset version + filters
 def _clear_response_caches():
     # Drop all per-response caches.
     _resp_cache_bubbles.clear()
     _resp_cache_summary.clear()
     _resp_cache_historical.clear()
-
-def _bump_dataset_version():
-    global _dataset_version, _build_dicts_cache
-    _dataset_version += 1
-    _build_dicts_cache = {"version": None, "value": None}
-    _clear_response_caches()
-
-def get_df() -> pd.DataFrame:
-    # Get cached DataFrame; lazy-load on first access and tag data source.
-    global _df_cache, _data_source
-    if _df_cache is None:
-        _df_cache = load_df()
-        _bump_dataset_version()
-        if _data_source == "unknown":
-            _data_source = "default"
-    return _df_cache
-
-def filter_df(df: pd.DataFrame, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
-    # Filter by ISO date range [start, end).
-    m = pd.Series(True, index=df.index)
-    if start:
-        try:
-            start_dt = pd.to_datetime(start, utc=True)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid 'start' date format. Use ISO like 2021-01-01.")
-        m &= df["ts"] >= start_dt
-    if end:
-        try:
-            end_dt = pd.to_datetime(end, utc=True)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid 'end' date format. Use ISO like 2021-12-31.")
-        m &= df["ts"] < end_dt
-    return df[m]
-
-def to_hours(ms: float) -> float:
-    # Convert milliseconds -> hours (rounded).
-    return round(float(ms) / 3_600_000, 3)
 
 def get_app_token_sync() -> str:
     # Sync variant of app token retrieval (for requests usage).
@@ -459,6 +321,14 @@ def batch_artists(ids_tuple):
 # Derived dictionaries (cached per dataset+filters)
 _build_dicts_cache_map: dict = {}
 
+
+def _on_dataset_change(_version: int) -> None:
+    _clear_response_caches()
+    _build_dicts_cache_map.clear()
+
+
+history.register_on_change(_on_dataset_change)
+
 def build_dicts(df: pd.DataFrame, filter_key: Optional[tuple] = None):
     # Build and cache mappings used across endpoints.
     #
@@ -466,7 +336,8 @@ def build_dicts(df: pd.DataFrame, filter_key: Optional[tuple] = None):
     # - artist_album_to_id: "Artist::Album" -> track_id
     # - id_to_artist_album: track_id -> "Artist::Album"
     # - track_artist_to_album: "Track::Artist" -> album
-    key = (_dataset_version, filter_key)
+    dataset_version = history.get_dataset_version()
+    key = (dataset_version, filter_key)
     hit = _build_dicts_cache_map.get(key)
     if hit is not None:
         return hit
@@ -594,7 +465,7 @@ def aggregates(df: pd.DataFrame, group_by: Literal["artist","album"], filter_key
             {
                 "name": r["master_metadata_track_name"],
                 "ms": int(r["track_ms"]),
-                "hours": to_hours(r["track_ms"]),
+                "hours": history.to_hours(r["track_ms"]),
                 "plays": int(r["track_plays"]),
             }
             for _, r in sub.iterrows()
@@ -606,7 +477,7 @@ def aggregates(df: pd.DataFrame, group_by: Literal["artist","album"], filter_key
             "id": name,
             "label": name,
             "value_ms": ms_total,
-            "value_hours": to_hours(ms_total),
+            "value_hours": history.to_hours(ms_total),
             "value_pct": pct,
             "plays": int(row["plays"]),
             "distinct_tracks": int(row["distinct_tracks"]),
@@ -634,7 +505,7 @@ def aggregates(df: pd.DataFrame, group_by: Literal["artist","album"], filter_key
     return {
         "group_by": group_by,
         "total_ms": total_ms,
-        "total_hours": to_hours(total_ms),
+        "total_hours": history.to_hours(total_ms),
         "total_plays": int(df.shape[0]),
         "items": items,
         "artist_album_to_id": aa_id,
@@ -998,18 +869,19 @@ except Exception:
 @app.get("/api/summary")
 def api_summary(start: Optional[str] = None, end: Optional[str] = None):
     # Totals for the selected window (ms, hours, plays).
-    key = (_dataset_version, start or "", end or "")
+    dataset_version = history.get_dataset_version()
+    key = (dataset_version, start or "", end or "")
     cached = _resp_cache_summary.get(key)
     if cached is not None:
         return cached
 
     _t0 = time.perf_counter()
-    df = filter_df(get_df(), start, end)
+    df = history.filter_df(history.get_df(), start, end)
     _t_filter_end = time.perf_counter()
     total_ms = int(df["ms_played"].sum())
     out = {
         "total_ms": total_ms,
-        "total_hours": to_hours(total_ms),
+        "total_hours": history.to_hours(total_ms),
         "total_plays": int(df.shape[0]),
         "start": start,
         "end": end,
@@ -1028,13 +900,14 @@ def api_bubbles(
     end: Optional[str] = None
 ):
     # Bubble items for artists/albums with image hydration and timings.
-    key = (_dataset_version, start or "", end or "", group_by)
+    dataset_version = history.get_dataset_version()
+    key = (dataset_version, start or "", end or "", group_by)
     cached = _resp_cache_bubbles.get(key)
     if cached is not None:
         return cached
 
     _t0 = time.perf_counter()
-    df = filter_df(get_df(), start, end)
+    df = history.filter_df(history.get_df(), start, end)
     _t_filter_end = time.perf_counter()
     out = aggregates(df, group_by, filter_key=(start or "", end or ""))
     timings = out.get("timings", {})
@@ -1050,14 +923,14 @@ def api_bubbles(
     def _prewarm_other_views():
         try:
             other_group = "album" if group_by == "artist" else "artist"
-            other_key = (_dataset_version, start or "", end or "", other_group)
+            other_key = (dataset_version, start or "", end or "", other_group)
             if _resp_cache_bubbles.get(other_key) is None:
-                df2 = filter_df(get_df(), start, end)
+                df2 = history.filter_df(history.get_df(), start, end)
                 _resp_cache_bubbles[other_key] = aggregates(df2, other_group, filter_key=(start or "", end or ""))
 
-            hist_key = (_dataset_version, start or "", end or "", int(200))
+            hist_key = (dataset_version, start or "", end or "", int(200))
             if _resp_cache_historical.get(hist_key) is None:
-                df3 = filter_df(get_df(), start, end)
+                df3 = history.filter_df(history.get_df(), start, end)
                 _resp_cache_historical[hist_key] = historical_data(df3, 200, filter_key=(start or "", end or ""))
         except Exception:
             pass
@@ -1072,13 +945,14 @@ def api_historical_data(
     limit: Optional[int] = Query(200, ge=1, le=500),
 ):
     # Tabular top artists/albums/tracks (limited).
-    key = (_dataset_version, start or "", end or "", int(limit) if limit is not None else None)
+    dataset_version = history.get_dataset_version()
+    key = (dataset_version, start or "", end or "", int(limit) if limit is not None else None)
     cached = _resp_cache_historical.get(key)
     if cached is not None:
         return cached
 
     _t0 = time.perf_counter()
-    df = filter_df(get_df(), start, end)
+    df = history.filter_df(history.get_df(), start, end)
     _t_filter_end = time.perf_counter()
     _t_build_start = time.perf_counter()
     out = historical_data(df, limit, filter_key=(start or "", end or ""))
@@ -1124,28 +998,33 @@ async def api_upload_history(file: UploadFile = File(...)):
         raise HTTPException(400, f"Could not parse file: {exc}") from exc
 
     try:
-        df = _prepare_history_dataframe(raw_df)
+        df = history.prepare_history_dataframe(raw_df)
     except Exception as exc:
         raise HTTPException(400, f"Invalid data format: {exc}") from exc
 
-    global _df_cache, _data_source
-    _df_cache = df
-    _data_source = "uploaded"
-    _bump_dataset_version()
-
+    history.set_df(df, "uploaded")
     return {"status": "ok", "rows": int(df.shape[0]), "source": "uploaded"}
 
 
 @app.post("/api/use_default_history")
 def api_use_default_history():
     # Switch data source to packaged/default dataset (idempotent).
-    global _df_cache, _data_source
-    if _data_source == "default" and _df_cache is not None:
-        return {"status": "ok", "rows": int(_df_cache.shape[0]), "source": "default", "idempotent": True}
-    _df_cache = load_df()
-    _data_source = "default"
-    _bump_dataset_version()
-    return {"status": "ok", "rows": int(_df_cache.shape[0]), "source": "default", "idempotent": False}
+    if history.get_data_source() == "default" and history.has_cached_df():
+        cached = history.get_df()
+        return {
+            "status": "ok",
+            "rows": int(cached.shape[0]),
+            "source": "default",
+            "idempotent": True,
+        }
+    df = history.load_df()
+    history.set_df(df, "default")
+    return {
+        "status": "ok",
+        "rows": int(df.shape[0]),
+        "source": "default",
+        "idempotent": False,
+    }
 
 
 @app.get("/api/tracks-batch")
