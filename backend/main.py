@@ -13,7 +13,6 @@
 from __future__ import annotations
 import os
 from typing import Literal, Optional, Sequence
-from datetime import datetime
 import time
 import json
 import io
@@ -29,34 +28,40 @@ import requests
 import threading
 
 try:
+    from backend.config import (
+        AWS_REGION,
+        DATA_PATH,
+        DEMO_MODE,
+        IMAGE_CACHE_S3_BUCKET,
+        IMAGE_CACHE_S3_KEY,
+        REQUIRED_COLUMNS,
+        S3_BUCKET,
+        S3_ETAG_CACHE,
+        S3_KEY,
+        SPOTIFY_CLIENT_ID,
+        SPOTIFY_CLIENT_SECRET,
+    )
+except ModuleNotFoundError:
+    from config import (
+        AWS_REGION,
+        DATA_PATH,
+        DEMO_MODE,
+        IMAGE_CACHE_S3_BUCKET,
+        IMAGE_CACHE_S3_KEY,
+        REQUIRED_COLUMNS,
+        S3_BUCKET,
+        S3_ETAG_CACHE,
+        S3_KEY,
+        SPOTIFY_CLIENT_ID,
+        SPOTIFY_CLIENT_SECRET,
+    )
+
+try:
     import boto3
     from botocore.exceptions import BotoCoreError, ClientError
 except ImportError:  # pragma: no cover - optional dependency for local dev
     boto3 = None
     BotoCoreError = ClientError = Exception
-
-# === Env loading (local dev, optional) ===
-try:
-    # Load alongside backend/main.py if present
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
-    # Then load project-root .env if present
-    load_dotenv(override=False)
-except Exception:
-    # Do not fail if python-dotenv is not installed
-    pass
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    # Parse a boolean env var with sane defaults.
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-# Spotify API credentials
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-DEMO_MODE = _env_bool("DEMO_MODE", False)
 
 # Used to fetch the app token from Spotify
 _token_cache = {"access_token": None, "expires_at": 0.0}
@@ -81,35 +86,6 @@ async def get_app_token() -> str:
         _token_cache["access_token"] = data["access_token"]
         _token_cache["expires_at"] = time.time() + data.get("expires_in", 3600)
         return _token_cache["access_token"]
-
-
-# === Config ===
-DATA_PATH = os.getenv(
-    "SPOTIFY_HISTORY_PATH",
-    os.path.join(os.path.dirname(__file__), "data", "cleaned_streaming_history.csv"),
-)
-
-S3_BUCKET = os.getenv("SPOTIFY_HISTORY_S3_BUCKET")
-S3_KEY = os.getenv("SPOTIFY_HISTORY_S3_KEY")
-S3_ETAG_CACHE: dict[str, Optional[str]] = {"etag": None, "path": None}
-AWS_REGION = os.getenv("AWS_REGION")
-
-# Optional separate S3 location for the image/metadata cache (defaults to history bucket)
-IMAGE_CACHE_S3_BUCKET = os.getenv("SPOTIFY_IMAGE_CACHE_S3_BUCKET") or S3_BUCKET
-IMAGE_CACHE_S3_KEY = os.getenv("SPOTIFY_IMAGE_CACHE_S3_KEY", "static_data.json")
-
-REQUIRED_COLUMNS = [
-    "ts",
-    "ms_played",
-    "master_metadata_track_name",
-    "master_metadata_album_artist_name",
-    "master_metadata_album_album_name",
-    "spotify_track_uri",
-    "reason_start",
-    "reason_end",
-    "shuffle",
-    "skipped",
-]
 
 
 def _prepare_history_dataframe(df: pd.DataFrame) -> pd.DataFrame:
