@@ -11,8 +11,7 @@
 # - Observability wiring
 
 from __future__ import annotations
-import os
-from typing import Literal, Optional, Sequence
+from typing import Literal, Optional
 import time
 import json
 import io
@@ -35,6 +34,11 @@ try:
     from backend import hydration_aggregation as analytics
 except ModuleNotFoundError:
     import hydration_aggregation as analytics  # type: ignore
+
+try:
+    from backend import observability
+except ModuleNotFoundError:
+    import observability  # type: ignore
 
 try:
     from backend.config import (
@@ -268,203 +272,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-def _is_low_value_span_value(value: object) -> bool:
-    # Return True if the value clearly references low-value routes (/healthz, /metrics).
-    if value is None:
-        return False
-    if isinstance(value, bytes):
-        try:
-            value = value.decode("utf-8", "ignore")
-        except Exception:
-            return False
-    text = str(value).strip().lower()
-    if not text:
-        return False
-    suffixes = ("/healthz", "/metrics", "/metrics/")
-    if any(text == suffix for suffix in suffixes):
-        return True
-    if any(text.endswith(suffix) for suffix in suffixes):
-        return True
-    prefixes = (
-        "get /healthz",
-        "head /healthz",
-        "get /metrics",
-        "head /metrics",
-    )
-    if any(text.startswith(prefix) for prefix in prefixes):
-        return True
-    return False
-
-
-def _span_is_low_value(span) -> bool:
-    # Inspect name + common HTTP attributes to detect low-value spans (health/metrics).
-    try:
-        attributes = getattr(span, "attributes", {}) or {}
-    except Exception:
-        attributes = {}
-
-    candidates = [
-        getattr(span, "name", ""),
-        attributes.get("http.target"),
-        attributes.get("http.route"),
-        attributes.get("http.path"),
-        attributes.get("http.request.uri"),
-        attributes.get("url.path"),
-        attributes.get("http.url"),
-        attributes.get("url.full"),
-    ]
-    return any(_is_low_value_span_value(value) for value in candidates)
-
-
-# Tracing: OpenTelemetry (select OTLP HTTP/GRPC via env)
-try:
-    if not getattr(app, "_otel_tracing_initialized", False) and not DEMO_MODE:
-        import os
-        from opentelemetry import trace
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import (
-            BatchSpanProcessor,
-            SpanExportResult,
-            SpanExporter,
-        )
-        # AWS X-Ray ID/propagation
-        from opentelemetry.sdk.extension.aws.trace import AwsXRayIdGenerator
-        from opentelemetry.propagators.aws import AwsXRayPropagator
-        from opentelemetry.propagate import set_global_textmap
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as OTLPSpanExporterGRPC
-        # HTTP exporter imported lazily if requested
-        import logging
-
-
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.instrumentation.requests import RequestsInstrumentor
-
-        class _LowValueFilterSpanExporter(SpanExporter):
-            # Wrap another exporter and drop health/metrics spans before export.
-
-            def __init__(self, delegate: SpanExporter):
-                self._delegate = delegate
-
-            def export(self, spans: Sequence):
-                filtered = [span for span in spans if not _span_is_low_value(span)]
-                if not filtered:
-                    return SpanExportResult.SUCCESS
-                return self._delegate.export(filtered)
-
-            def shutdown(self) -> None:
-                return self._delegate.shutdown()
-
-            def force_flush(self, timeout_millis: int | None = None) -> bool:
-                return self._delegate.force_flush(timeout_millis=timeout_millis)
-
-        resource = Resource.create({
-            "service.name": os.getenv("OTEL_SERVICE_NAME", "backend"),
-            "service.namespace": "trackgraph",
-        })
-
-        provider = TracerProvider(resource=resource, id_generator=AwsXRayIdGenerator())
-        trace.set_tracer_provider(provider)
-
-        # Use AWS X-Ray propagation so traces stitch in X-Ray UI
-        set_global_textmap(AwsXRayPropagator())
-
-        # Decide protocol/endpoints from env
-        proto = (
-            os.getenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
-            or os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL")
-            or "grpc"
-        ).strip().lower()
-        traces_ep = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-        generic_ep = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-        exporter = None
-        chosen = None
-        ep_used = None
-
-        if proto.startswith("http"):
-            try:
-                from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as OTLPSpanExporterHTTP  # type: ignore
-                if traces_ep:
-                    ep_used = traces_ep
-                elif generic_ep:
-                    ep_used = generic_ep.rstrip("/") + "/v1/traces"
-                else:
-                    ep_used = "http://localhost:4318/v1/traces"
-                exporter = OTLPSpanExporterHTTP(endpoint=ep_used)
-                chosen = f"otlp-http:{ep_used}"
-            except Exception as _http_exc:
-                # HTTP exporter not available. If the configured endpoint is HTTP(S),
-                # do NOT fall back to gRPC (would 404/464). Disable exporting instead.
-                http_like = (traces_ep or generic_ep or "").startswith("http")
-                if http_like:
-                    try:
-                        logging.getLogger("startup").warning(
-                            "otel_exporter_unavailable",
-                            extra={
-                                "protocol": proto,
-                                "endpoint": (traces_ep or generic_ep),
-                                "reason": "missing otlp http exporter",
-                            },
-                        )
-                    except Exception:
-                        pass
-                    exporter = None
-                    chosen = "disabled"
-                else:
-                    proto = "grpc"
-
-        if exporter is None and proto == "grpc":
-            ep_used = traces_ep or generic_ep or "grpc://localhost:4317"
-            insecure = ep_used.startswith(("grpc://", "http://"))
-            exporter = OTLPSpanExporterGRPC(endpoint=ep_used, insecure=insecure)
-            chosen = f"otlp-grpc:{ep_used}"
-
-        try:
-            logging.getLogger("startup").info(
-                "otel_exporter",
-                extra={"protocol": proto, "endpoint": ep_used, "chosen": chosen},
-            )
-        except Exception:
-            pass
-
-        if exporter is not None:
-            exporter = _LowValueFilterSpanExporter(exporter)
-            provider.add_span_processor(BatchSpanProcessor(exporter))
-        else:
-            try:
-                logging.getLogger("startup").info(
-                    "otel_exporter_disabled", extra={"protocol": proto, "endpoint": ep_used}
-                )
-            except Exception:
-                pass
-
-        # Auto-instrument (skip health/metrics to reduce noise)
-        FastAPIInstrumentor().instrument_app(app, excluded_urls=r"^/(healthz|metrics)$")
-        RequestsInstrumentor().instrument()
-
-        setattr(app, "_otel_tracing_initialized", True)
-except Exception:
-    # Never break the app if tracing setup fails
-    pass
-
-# Observability: JSON logs + Prometheus /metrics
-try:
-    # Local import (same directory as main.py)
-    from instrumentation import request_logger_middleware, make_metrics_asgi_app  # type: ignore
-
-    # In demo mode, disable request logging middleware and metrics entirely.
-    if not getattr(app, "_instrumentation_initialized", False):
-        if not DEMO_MODE:
-            app.middleware("http")(request_logger_middleware)
-            # Use wrapped metrics app that logs incoming Host/X-Forwarded-* headers
-            app.mount("/metrics", make_metrics_asgi_app())
-        setattr(app, "_instrumentation_initialized", True)
-except Exception:
-    # Never break the app if instrumentation fails to import
-    pass
+observability.setup(app, DEMO_MODE)
 
 # Routes
 
